@@ -1,0 +1,25 @@
+Notes
+=====
+
+Get files in directory:
+> $ find path/to/dir -type f -exec shasum -a 256 {} \; > x_library_checksums.txt
+
+Filter out non-music:
+> $ grep -vE '(Thumbs.db|\.png|\.ini|\.jpg|\.DS_Store|txt)$' x_library_checksums.txt > x_library_checksums_pruned.txt
+
+Sort:
+> $ sort x_library_checksums_pruned.txt > x.sorted
+
+Get just the hashes
+> $ cut -d ' ' -f1 x.sorted > x.hashes
+
+> $ comm -23 source.hashes nas.hashes | wc -l
+
+Get the lines from nas's checksums that match the checksums of source's songs:
+> $ grep -F -f source.hashes nas.sorted > nas_from_source.txt
+> $ sed -E 's/^([0-9a-zA-Z]{64})  /\1\t/' nas_from_source.txt > nas_from_source.map
+> $ sed -E 's/^([0-9a-zA-Z]{64})  /\1\t/' source.sorted > source.map
+> $ join -t $'\t' source.map nas_from_source.map > joined.txt
+
+Find files that are in a different location on nas from on source computer:
+awk -F '\t' '$2 != $3' joined.txt > moved_files.txt
