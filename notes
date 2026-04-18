@@ -23,3 +23,24 @@ Get the lines from nas's checksums that match the checksums of source's songs:
 
 Find files that are in a different location on nas from on source computer:
 awk -F '\t' '$2 != $3' joined.txt > moved_files.txt
+
+
+
+
+Running the library snapshot/scan scripts
+-----------------------------------------
+On laptop:
+```
+    ./snapshot_source_music_library.py
+    scp source_output.json nas:music_library_cleanup/
+```
+On nas:
+```
+    ./scan_library.py
+```
+
+To look at output:
+
+* `jq . stale.json` look at info about files that may be out of date on the NAS (similar file has different hash on source)
+* `jq .[].path exact.json` print NAS file paths for files that also exist on source
+* `jq -r '.[] | "\(.path) -> \(.source_matches[0].source):\(.source_matches[0].path)"' stale.json` print paths on NAS and source library for files that are likely matches
