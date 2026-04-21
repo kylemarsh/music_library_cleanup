@@ -1,15 +1,5 @@
 #!/usr/bin/env python3
 
-"""
-Intended to help detect duplicates between a music library on a NAS and the
-source libraries that feed it new music.
-
-Run this on the NAS, or wherever your library lives, after having run
-`snapshot_source_music_library.py` on the source library.
-
-Requires ffprobe
-"""
-
 import os
 import hashlib
 import subprocess
@@ -48,11 +38,13 @@ def normalize_duration(d):
         return None
 
 def build_key(meta):
-    return (
-        normalize_text(meta.get("artist")),
-        normalize_text(meta.get("title")),
-        normalize_duration(meta.get("duration")),
-    )
+    artist = normalize_text(meta.get("artist"))
+    title = normalize_text(meta.get("title"))
+    duration = normalize_duration(meta.get("duration"))
+
+    if not artist or not title:
+        return None
+    return (artist, title, duration)
 
 # ---------- file helpers ----------
 
@@ -78,26 +70,40 @@ def get_metadata(path, ffprobe_bin):
             ffprobe_bin,
             "-v", "error",
             "-show_entries",
-            "format=duration:format_tags=artist,title",
-            "-of", "default=noprint_wrappers=1:nokey=0",
+            "format=duration,bit_rate:format_tags=artist,title:stream=codec_name,bit_rate,sample_rate,bits_per_sample",
+            "-of", "json",
             path
         ],
         capture_output=True,
         text=True
     )
 
-    data = {}
-    for line in result.stdout.splitlines():
-        if "=" in line:
-            k, v = line.split("=", 1)
-            data[k.strip()] = v.strip()
+    try:
+        data = json.loads(result.stdout)
+    except:
+        return {}
 
-    tags = {k.replace("TAG:", ""): v for k, v in data.items() if k.startswith("TAG:")}
+    fmt = data.get("format", {})
+    tags = fmt.get("tags", {})
+    streams = data.get("streams", [])
+    audio = streams[0] if streams else {}
+
+    def to_int(x):
+        try:
+            return int(x)
+        except:
+            return None
 
     return {
+        # -- Matching fields --
         "artist": tags.get("artist"),
         "title": tags.get("title"),
-        "duration": data.get("duration"),
+        "duration": fmt.get("duration"),
+        # -- quality fields --
+        "codec": audio.get("codec_name"),
+        "bitrate": to_int(fmt.get("bit_rate")) or to_int(audio.get("bit_rate")),
+        "sample_rate": to_int(audio.get("sample_rate")),
+        "bits_per_sample": to_int(audio.get("bits_per_sample")),
     }
 
 # ---------- cache ----------
@@ -141,10 +147,16 @@ def scan_library(root, cache, ffprobe_bin):
                 record = {
                     "path": relative,
                     "hash": sha1(full),
+
                     "artist": meta["artist"],
                     "title": meta["title"],
                     "duration": meta["duration"],
                     "key": build_key(meta),
+
+                    "codec": meta.get("codec"),
+                    "bitrate": meta.get("bitrate"),
+                    "sample_rate": meta.get("sample_rate"),
+                    "bits_per_sample": meta.get("bits_per_sample"),
                 }
 
             updated_cache[full] = {
@@ -171,11 +183,13 @@ def load_snapshots(paths):
         for r in data:
             entry = {
                 "path": r["path"],
-                "source": r.get("source", snapshot_path)
+                "source": r.get("source", snapshot_path),
+                "hash": r["hash"]
             }
 
             source_hash_map[r["hash"]].append(entry)
-            source_key_map[tuple(r["key"])].append(entry)
+            if r["key"] is not None:
+                source_key_map[tuple(r["key"])].append(entry)
 
     return source_hash_map, source_key_map
 
@@ -193,7 +207,7 @@ def compare(nas_records, snapshot_paths):
             record["source_matches"] = source_hash_map[r["hash"]]
             exact.append(record)
 
-        elif tuple(r["key"]) in source_key_map:
+        elif r["key"] is not None and tuple(r["key"]) in source_key_map:
             record["source_matches"] = source_key_map[tuple(r["key"])]
             stale.append(record)
 
@@ -206,9 +220,9 @@ def compare(nas_records, snapshot_paths):
 # ---------- main ----------
 
 if __name__ == "__main__":
-    NAS_ROOT = "/volume//Music"
+    NAS_ROOT = "/volume/Music"
     SNAPSHOTS = [
-        "/home/nas_user/music_cleanup/source1_snapshot.json"
+        "/home/nas_user/music_cleanup/source1_snapshot.json",
         "/home/nas_user/music_cleanup/source2_snapshot.json"
     ]
     FFPROBE = "/usr/local/bin/ffprobe"

@@ -44,3 +44,17 @@ To look at output:
 * `jq . stale.json` look at info about files that may be out of date on the NAS (similar file has different hash on source)
 * `jq .[].path exact.json` print NAS file paths for files that also exist on source
 * `jq -r '.[] | "\(.path) -> \(.source_matches[0].source):\(.source_matches[0].path)"' stale.json` print paths on NAS and source library for files that are likely matches
+
+`jq . exact.json > exact.formatted; jq . stale.json > stale.formatted; jq . unknown.json > unknown.formatted`
+
+Comparing matches between NAS and source:
+Find files that have exactly the same contents under differnt names and remove them from the NAS library (to be copied fresh from the source library later):
+```
+$ jq .[].path exact.json > nas.exact
+$ jq -r .[].source_matches[0].path exact.json > source.exact
+$ vimdiff nas.exact source.exact #that are different indicate a file on the NAS with a different filename than on the source, but whose hash matches exactly
+$ paste nas.exact source.exact | awk -F'\t' '$1 != $2 {print $1}' > files-to-move.txt
+$ rsync --dry-run -av --remove-source-files --files-from files-to-move.txt /path/to/library/ /path/to/backup/
+```
+
+

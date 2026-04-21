@@ -53,26 +53,40 @@ def get_metadata(path):
             "ffprobe",
             "-v", "error",
             "-show_entries",
-            "format=duration:format_tags=artist,title",
-            "-of", "default=noprint_wrappers=1:nokey=0",
+            "format=duration,bit_rate:format_tags=artist,title:stream=codec_name,bit_rate,sample_rate,bits_per_sample",
+            "-of", "json",
             path
         ],
         capture_output=True,
         text=True
     )
 
-    data = {}
-    for line in result.stdout.splitlines():
-        if "=" in line:
-            k, v = line.split("=", 1)
-            data[k.strip()] = v.strip()
+    try:
+        data = json.loads(result.stdout)
+    except:
+        return {}
 
-    tags = {k.replace("TAG:", ""): v for k, v in data.items() if k.startswith("TAG:")}
+    fmt = data.get("format", {})
+    tags = fmt.get("tags", {})
+    streams = data.get("streams", [])
+    audio = streams[0] if streams else {}
+
+    def to_int(x):
+        try:
+            return int(x)
+        except:
+            return None
 
     return {
+        # -- Matching fields --
         "artist": tags.get("artist"),
         "title": tags.get("title"),
-        "duration": data.get("duration"),
+        "duration": fmt.get("duration"),
+        # -- quality fields --
+        "codec": audio.get("codec_name"),
+        "bitrate": to_int(fmt.get("bit_rate")) or to_int(audio.get("bit_rate")),
+        "sample_rate": to_int(audio.get("sample_rate")),
+        "bits_per_sample": to_int(audio.get("bits_per_sample")),
     }
 
 def build_key(meta):
@@ -99,16 +113,24 @@ def scan(root):
                 "path": full.removeprefix(root),
                 "source": SOURCE_NAME,
                 "hash": sha1(full),
+
+                # matching fields
                 "artist": meta["artist"],
                 "title": meta["title"],
                 "duration": meta["duration"],
                 "key": build_key(meta),
+
+                # quality fields
+                "codec": meta.get("codec"),
+                "bitrate": meta.get("bitrate"),
+                "sample_rate": meta.get("sample_rate"),
+                "bits_per_sample": meta.get("bits_per_sample"),
             })
 
     return records
 
 if __name__ == "__main__":
-    ROOT = "/Users/kylem/Music/Music/Media.localized/Music"
+    ROOT = "/path/to/my/Music"
     OUTPUT = "kyle_snapshot.json"
 
     records = scan(ROOT)
