@@ -184,7 +184,12 @@ def load_snapshots(paths):
             entry = {
                 "path": r["path"],
                 "source": r.get("source", snapshot_path),
-                "hash": r["hash"]
+                "hash": r["hash"],
+
+                "codec": r.get("codec"),
+                "bitrate": r.get("bitrate"),
+                "sample_rate": r.get("sample_rate"),
+                "bits_per_sample": r.get("bits_per_sample"),
             }
 
             source_hash_map[r["hash"]].append(entry)
@@ -225,6 +230,7 @@ if __name__ == "__main__":
         "/home/nas_user/music_cleanup/source1_snapshot.json",
         "/home/nas_user/music_cleanup/source2_snapshot.json"
     ]
+    OUTDIR = "./scan_results"
     FFPROBE = "/usr/local/bin/ffprobe"
 
     cache = load_cache()
@@ -242,12 +248,14 @@ if __name__ == "__main__":
     print(f"Likely duplicates (metadata match): {len(stale)}")
     print(f"Only on NAS: {len(unknown)}")
 
-    # optional: dump lists
-    with open("exact.json", "w") as f:
+    if not os.path.exists(OUTDIR):
+        os.mkdir(OUTDIR)
+
+    with open(os.path.join(OUTDIR, "exact.json"), "w") as f:
         json.dump(exact, f)
 
-    with open("stale.json", "w") as f:
+    with open(os.path.join(OUTDIR, "stale.json"), "w") as f:
         json.dump(stale, f)
 
-    with open("unknown.json", "w") as f:
+    with open(os.path.join(OUTDIR, "unknown.json"), "w") as f:
         json.dump(unknown, f)
