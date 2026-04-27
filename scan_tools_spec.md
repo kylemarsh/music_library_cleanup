@@ -41,7 +41,7 @@ Generate a **normalized, portable representation** of a source music library for
 ## 3.2 Inputs
 
 * Root directory of a music library
-* Optional identifier for the source (e.g., `"liz_laptop"`)
+* Optional identifier for the source (e.g., `"source1"`)
 
 ---
 

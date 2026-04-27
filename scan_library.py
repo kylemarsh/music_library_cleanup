@@ -38,6 +38,8 @@ def normalize_duration(d):
         return None
 
 def build_key(meta):
+    """Full key: (normalized_artist, normalized_title, duration_seconds).
+    Used for stale matching. Returns None if artist or title is missing."""
     artist = normalize_text(meta.get("artist"))
     title = normalize_text(meta.get("title"))
     duration = normalize_duration(meta.get("duration"))
@@ -45,6 +47,17 @@ def build_key(meta):
     if not artist or not title:
         return None
     return (artist, title, duration)
+
+def build_fuzzy_key(meta):
+    """Fuzzy key: (normalized_artist, normalized_title) — no duration.
+    Used as a fallback when stale matching fails (e.g. re-encodes that shifted
+    duration). Returns None if artist or title is missing."""
+    artist = normalize_text(meta.get("artist"))
+    title = normalize_text(meta.get("title"))
+
+    if not artist or not title:
+        return None
+    return (artist, title)
 
 # ---------- file helpers ----------
 
@@ -140,6 +153,12 @@ def scan_library(root, cache, ffprobe_bin):
             if full in cache and cache[full]["sig"] == sig:
                 reused += 1
                 record = cache[full]["record"]
+                # Back-fill fuzzy_key for records cached before this field existed
+                if "fuzzy_key" not in record:
+                    record["fuzzy_key"] = build_fuzzy_key({
+                        "artist": record.get("artist"),
+                        "title": record.get("title"),
+                    })
             else:
                 meta = get_metadata(full, ffprobe_bin)
                 if full.startswith(root):
@@ -148,10 +167,11 @@ def scan_library(root, cache, ffprobe_bin):
                     "path": relative,
                     "hash": sha1(full),
 
-                    "artist": meta["artist"],
-                    "title": meta["title"],
-                    "duration": meta["duration"],
+                    "artist": meta.get("artist"),
+                    "title": meta.get("title"),
+                    "duration": meta.get("duration"),
                     "key": build_key(meta),
+                    "fuzzy_key": build_fuzzy_key(meta),
 
                     "codec": meta.get("codec"),
                     "bitrate": meta.get("bitrate"),
@@ -173,8 +193,16 @@ def scan_library(root, cache, ffprobe_bin):
 # ---------- comparison ----------
 
 def load_snapshots(paths):
+    """Build lookup maps from source snapshot files.
+
+    Returns three dicts:
+      source_hash_map:       hash       -> [source entries]
+      source_key_map:        key tuple  -> [source entries]  (artist+title+duration)
+      source_fuzzy_key_map:  fuzzy tuple-> [source entries]  (artist+title only)
+    """
     source_hash_map = defaultdict(list)
     source_key_map = defaultdict(list)
+    source_fuzzy_key_map = defaultdict(list)
 
     for snapshot_path in paths:
         with open(snapshot_path) as f:
@@ -193,16 +221,34 @@ def load_snapshots(paths):
             }
 
             source_hash_map[r["hash"]].append(entry)
-            if r["key"] is not None:
-                source_key_map[tuple(r["key"])].append(entry)
 
-    return source_hash_map, source_key_map
+            if r.get("key") is not None:
+                source_key_map[tuple(r["key"])].append(entry)
+                # Derive fuzzy key from the full key (first two elements: artist, title)
+                fuzzy_key = (r["key"][0], r["key"][1])
+                source_fuzzy_key_map[fuzzy_key].append(entry)
+
+    return source_hash_map, source_key_map, source_fuzzy_key_map
+
 
 def compare(nas_records, snapshot_paths):
-    source_hash_map, source_key_map = load_snapshots(snapshot_paths)
+    """Classify NAS records against source snapshots into four tiers.
+
+    Tiers (in priority order — a record appears in exactly one):
+      exact  — SHA-1 hash matches a source file
+      stale  — (artist, title, duration) key matches; hash differs
+      fuzzy  — (artist, title) matches; hash and duration both differ
+      unknown — no match at any tier
+
+    Fuzzy matches are a lower-confidence fallback for tracks that were
+    re-encoded with a slightly different duration. They always require
+    manual review in the cleanup tool.
+    """
+    source_hash_map, source_key_map, source_fuzzy_key_map = load_snapshots(snapshot_paths)
 
     exact = []
     stale = []
+    fuzzy = []
     unknown = []
 
     for r in nas_records:
@@ -212,15 +258,19 @@ def compare(nas_records, snapshot_paths):
             record["source_matches"] = source_hash_map[r["hash"]]
             exact.append(record)
 
-        elif r["key"] is not None and tuple(r["key"]) in source_key_map:
+        elif r.get("key") is not None and tuple(r["key"]) in source_key_map:
             record["source_matches"] = source_key_map[tuple(r["key"])]
             stale.append(record)
+
+        elif r.get("fuzzy_key") is not None and tuple(r["fuzzy_key"]) in source_fuzzy_key_map:
+            record["source_matches"] = source_fuzzy_key_map[tuple(r["fuzzy_key"])]
+            fuzzy.append(record)
 
         else:
             record["source_matches"] = []
             unknown.append(record)
 
-    return exact, stale, unknown
+    return exact, stale, fuzzy, unknown
 
 # ---------- main ----------
 
@@ -241,12 +291,13 @@ if __name__ == "__main__":
     save_cache(cache)
 
     print("Comparing...")
-    exact, stale, unknown = compare(records, SNAPSHOTS)
+    exact, stale, fuzzy, unknown = compare(records, SNAPSHOTS)
 
     print("\nResults:")
-    print(f"Exact matches: {len(exact)}")
-    print(f"Likely duplicates (metadata match): {len(stale)}")
-    print(f"Only on NAS: {len(unknown)}")
+    print(f"  Exact matches:              {len(exact)}")
+    print(f"  Stale matches (key only):   {len(stale)}")
+    print(f"  Fuzzy matches (no duration):{len(fuzzy)}")
+    print(f"  Unknown (NAS only):         {len(unknown)}")
 
     if not os.path.exists(OUTDIR):
         os.mkdir(OUTDIR)
@@ -256,6 +307,9 @@ if __name__ == "__main__":
 
     with open(os.path.join(OUTDIR, "stale.json"), "w") as f:
         json.dump(stale, f)
+
+    with open(os.path.join(OUTDIR, "fuzzy.json"), "w") as f:
+        json.dump(fuzzy, f)
 
     with open(os.path.join(OUTDIR, "unknown.json"), "w") as f:
         json.dump(unknown, f)

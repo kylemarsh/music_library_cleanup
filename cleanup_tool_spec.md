@@ -316,9 +316,9 @@ If no clear winner:
 Example:
 
 ```text
-/volume1/Music/Artist/Album/song.mp3
+/volume/Music/Artist/Album/song.mp3
 →
-/volume1/Music.cleaned/Artist/Album/song.mp3
+/volume/Music.cleaned/Artist/Album/song.mp3
 ```
 
 ---
@@ -336,7 +336,7 @@ Example:
 
 | Option                | Description                         |
 | --------------------- | ----------------------------------- |
-| `--music-root`        | NAS root (default `/volume1/Music`) |
+| `--music-root`        | NAS root (default `/volume/Music`) |
 | `--backup-root`       | backup location                     |
 | `--apply`             | perform moves (default: dry-run)    |
 | `--exclude`           | exclude path (repeatable)           |

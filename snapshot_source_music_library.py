@@ -8,7 +8,7 @@ import re
 import unicodedata
 
 AUDIO_EXTENSIONS = {".mp3", ".m4a", ".m4p", ".flac", ".aac", ".wav", ".alac"}
-SOURCE_NAME = 'kyle_laptop'
+SOURCE_NAME = 'source1'
 
 def is_audio_file(path):
     return os.path.splitext(path)[1].lower() in AUDIO_EXTENSIONS
@@ -131,7 +131,7 @@ def scan(root):
 
 if __name__ == "__main__":
     ROOT = "/path/to/my/Music"
-    OUTPUT = "kyle_snapshot.json"
+    OUTPUT = "src1_snapshot.json"
 
     records = scan(ROOT)
 
