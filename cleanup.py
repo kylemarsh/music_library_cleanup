@@ -14,7 +14,7 @@ pass --apply to execute them on the NAS.
 Usage:
   python cleanup.py \\
     --index index.jsonl \\
-    --source-priority liz_laptop kyle_laptop \\
+    --source-priority src1_laptop src2_laptop \\
     [--output-dir ./cleanup_results] \\
     [--music-root /volume1/Music] \\
     [--backup-root /volume1/Music.cleaned] \\
@@ -257,6 +257,13 @@ def source_actions_for(src_file_recs, canonical_src, is_clear, nas_action,
         else:
             if not is_clear:
                 act = "SRC_AMB"
+            elif (canonical_src is not None
+                  and sr.get("hash") == canonical_src.get("hash")
+                  and strip_leading_sep(sr.get("path", "")) ==
+                      strip_leading_sep(canonical_src.get("path", ""))):
+                # Byte-for-byte identical to canonical and same path — clean
+                # redundant copy that doesn't need to be removed.
+                act = "KEEP"
             else:
                 act = "SRC_D"
 
