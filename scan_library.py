@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
-scan_library.py — Scan the NAS music library and build a recording index.
+scan_library.py — Scan the NAS music library, build a recording index, and
+produce cleanup action files.
 
-Produces two artifacts:
-
-  music_audit_cache.json   — per-file metadata cache to speed up future runs
-  index.jsonl              — one JSON object per recording (NAS + all sources)
+Produces:
+  music_audit_cache.json     — per-file metadata cache (speeds up future runs)
+  index.jsonl                — one entry per recording across all libraries
+  decisions.jsonl            — one entry per recording with recommended actions
+  nas_actions.txt            — one tab-delimited line per NAS file
+  <source>_actions.txt       — one tab-delimited line per file in each source
 
 Usage:
   python scan_library.py \\
     --root /volume1/Music \\
-    --snapshots liz_snapshot.json kyle_snapshot.json \\
-    [--output index.jsonl] \\
+    --snapshots src1_snapshot.json src2_snapshot.json \\
+    --source-priority source1 source2 \\
+    [--output-dir ./results] \\
     [--cache music_audit_cache.json] \\
     [--ffprobe /usr/local/bin/ffprobe]
 """
@@ -29,9 +33,9 @@ from collections import defaultdict
 AUDIO_EXTENSIONS = {".mp3", ".m4a", ".m4p", ".flac", ".aac", ".wav", ".alac"}
 DEFAULT_CACHE    = "music_audit_cache.json"
 
-# ---------------------------------------------------------------------------
-# Text normalisation
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Part 1 — Normalisation & keys
+# ===========================================================================
 
 def normalize_text(s):
     if not s:
@@ -63,17 +67,16 @@ def build_key(meta):
     return (artist, title, dur)
 
 def build_fuzzy_key(meta):
-    """Probable-match key: (artist, title) — no duration.
-    Catches re-encodes where duration shifted by a second or two."""
+    """Probable-match key: (artist, title) — no duration."""
     artist = normalize_text(meta.get("artist"))
     title  = normalize_text(meta.get("title"))
     if not artist or not title:
         return None
     return (artist, title)
 
-# ---------------------------------------------------------------------------
-# File helpers
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Part 2 — File helpers, metadata, cache
+# ===========================================================================
 
 def is_audio_file(path):
     return os.path.splitext(path)[1].lower() in AUDIO_EXTENSIONS
@@ -88,10 +91,6 @@ def sha1(path, chunk_size=1 << 20):
 def file_signature(path):
     s = os.stat(path)
     return {"size": s.st_size, "mtime": s.st_mtime}
-
-# ---------------------------------------------------------------------------
-# Metadata extraction
-# ---------------------------------------------------------------------------
 
 def get_metadata(path, ffprobe_bin):
     result = subprocess.run(
@@ -128,10 +127,6 @@ def get_metadata(path, ffprobe_bin):
         "bits_per_sample": to_int(audio.get("bits_per_sample")),
     }
 
-# ---------------------------------------------------------------------------
-# Cache
-# ---------------------------------------------------------------------------
-
 def load_cache(path):
     if not os.path.exists(path):
         return {}
@@ -144,15 +139,13 @@ def save_cache(cache, path):
         json.dump(cache, f)
     os.replace(tmp, path)
 
-# ---------------------------------------------------------------------------
-# NAS scan
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Part 3 — NAS scan
+# ===========================================================================
 
 def scan_nas(root, cache, ffprobe_bin):
-    """Walk the NAS root and return (records, updated_cache).
-
-    Paths in records are relative to root with no leading separator.
-    """
+    """Walk the NAS root; return (records, updated_cache).
+    Paths are relative to root with no leading separator."""
     records       = []
     updated_cache = {}
     scanned = reused = 0
@@ -169,7 +162,6 @@ def scan_nas(root, cache, ffprobe_bin):
             if full in cache and cache[full]["sig"] == sig:
                 reused += 1
                 rec = dict(cache[full]["record"])
-                # Back-fill fuzzy_key for cache entries written before this field existed
                 if "fuzzy_key" not in rec:
                     rec["fuzzy_key"] = build_fuzzy_key({
                         "artist": rec.get("artist"),
@@ -198,20 +190,11 @@ def scan_nas(root, cache, ffprobe_bin):
     print(f"  NAS: {scanned} files scanned, {reused} from cache")
     return records, updated_cache
 
-# ---------------------------------------------------------------------------
-# Source snapshot loading
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Part 4 — Source snapshot loading
+# ===========================================================================
 
 def load_source_snapshots(snapshot_paths):
-    """Load all source snapshot files and build lookup indexes.
-
-    Returns:
-      source_names   list of source identifiers, in snapshot order
-      by_name        {source_name: [records]}
-      by_hash        {hash:              [records]}
-      by_key         {(artist,title,dur): [records]}
-      by_fuzzy       {(artist,title):     [records]}
-    """
     source_names = []
     by_name  = {}
     by_hash  = defaultdict(list)
@@ -222,7 +205,6 @@ def load_source_snapshots(snapshot_paths):
         with open(snap_path, encoding="utf-8") as f:
             raw = json.load(f)
 
-        # Use the source field from the first record; fall back to filename stem
         src_name = (raw[0].get("source") if raw else None) or \
                    os.path.splitext(os.path.basename(snap_path))[0]
 
@@ -245,63 +227,54 @@ def load_source_snapshots(snapshot_paths):
 
     return source_names, by_name, by_hash, by_key, by_fuzzy
 
-# ---------------------------------------------------------------------------
-# Recording index — union-find grouping
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Part 5 — Recording index (union-find grouping)
+# ===========================================================================
 
 class RecordingIndex:
     """Groups files from the NAS and all source libraries into recording entries.
-
-    A recording entry represents one distinct song/recording.  Multiple files
-    (possibly from different sources or left as duplicates on the NAS) may
-    belong to the same entry.
 
     Grouping rules
     --------------
     Certain match (hash or full artist+title+duration key):
       Files are merged into the same group.  Two NAS files that both certainly
-      match the same source file → one entry with a list of NAS files.
+      match the same source → one entry with a list under "nas".
 
     Probable match (artist+title only, no duration):
-      A new entry is always created.  If any matched source record is already
-      claimed by a certain group, a 'related' cross-reference is added instead
-      of merging.  We never merge on fuzzy evidence alone because two distinct
-      studio versions of the same song can have different durations.
+      Always a new entry; cross-referenced via "related".  Never merged on
+      fuzzy evidence alone — two studio versions of the same song can differ
+      in duration.
 
     No match:
       Each file becomes its own entry with identity_confidence "none".
     """
 
     def __init__(self):
-        self._groups     = {}        # gid -> group dict
-        self._parent     = {}        # union-find parent pointers
-        self._src_to_gid = {}        # (source_name, path) -> gid
-        self._nas_to_gid = {}        # nas_path -> gid
+        self._groups     = {}
+        self._parent     = {}
+        self._src_to_gid = {}
+        self._nas_to_gid = {}
         self._next       = 0
-
-    # -- union-find internals --
 
     def _new_gid(self, confidence):
         gid = self._next
         self._next += 1
         self._parent[gid] = gid
         self._groups[gid] = {
-            "nas_files":    [],                 # [(record, identity_match)]
-            "source_files": defaultdict(list),  # source_name -> [(record, identity_match)]
+            "nas_files":    [],
+            "source_files": defaultdict(list),
             "confidence":   confidence,
-            "related":      set(),              # gids of related-but-not-merged entries
+            "related":      set(),
         }
         return gid
 
     def _find(self, gid):
-        """Path-compressed root lookup."""
         while self._parent[gid] != gid:
             self._parent[gid] = self._parent[self._parent[gid]]
             gid = self._parent[gid]
         return gid
 
     def _union(self, gid_a, gid_b):
-        """Merge gid_b into gid_a.  Returns the surviving root gid."""
         ra, rb = self._find(gid_a), self._find(gid_b)
         if ra == rb:
             return ra
@@ -330,18 +303,14 @@ class RecordingIndex:
             self._nas_to_gid[rec["path"]] = gid
 
     def _add_src(self, gid, sr, match_type, claim=True):
-        k   = (sr["source"], sr["path"])
         src = sr["source"]
         existing = {r["path"] for r, _ in self._groups[gid]["source_files"][src]}
         if sr["path"] not in existing:
             self._groups[gid]["source_files"][src].append((sr, match_type))
         if claim:
-            self._src_to_gid.setdefault(k, gid)
-
-    # -- public interface --
+            self._src_to_gid.setdefault((src, sr["path"]), gid)
 
     def add_certain(self, nas_rec, src_recs):
-        """NAS file with certain-confidence source matches."""
         candidate_gids = set()
         for sr in src_recs:
             g = self._find_for_src(sr)
@@ -364,30 +333,20 @@ class RecordingIndex:
             self._add_src(gid, sr, "certain", claim=True)
 
     def add_probable(self, nas_rec, src_recs):
-        """NAS file with probable-confidence (fuzzy) source matches.
-
-        Always creates a new entry.  Adds 'related' links to any certain groups
-        that already own the matched source records.
-        """
         gid = self._new_gid("probable")
         self._add_nas(gid, nas_rec, "probable")
-
         for sr in src_recs:
             existing = self._find_for_src(sr)
             if existing is not None:
                 self._groups[gid]["related"].add(existing)
                 self._groups[existing]["related"].add(gid)
-            # Add to this entry unclaimed (source record belongs to certain group
-            # if existing is not None; we don't steal it)
             self._add_src(gid, sr, "probable", claim=(existing is None))
 
     def add_unknown_nas(self, nas_rec):
-        """NAS file with no source match."""
         gid = self._new_gid("none")
         self._add_nas(gid, nas_rec, "none")
 
     def add_source_certain(self, src_recs):
-        """Source-to-source certain match; no NAS file."""
         candidate_gids = set()
         for sr in src_recs:
             g = self._find_for_src(sr)
@@ -406,7 +365,6 @@ class RecordingIndex:
             self._add_src(gid, sr, "certain", claim=True)
 
     def add_source_probable(self, primary_rec, other_recs):
-        """Source-to-source probable match; no NAS file."""
         all_recs = [primary_rec] + other_recs
         candidate_gids = set()
         for sr in all_recs:
@@ -426,23 +384,20 @@ class RecordingIndex:
             self._add_src(gid, sr, "probable", claim=True)
 
     def add_source_only(self, src_rec):
-        """Single source file with no matches anywhere."""
         gid = self._new_gid("none")
         self._add_src(gid, src_rec, "none", claim=True)
 
     def all_groups(self):
-        """Yield (gid, group) for every live (non-merged) group."""
         for gid, g in self._groups.items():
             if self._find(gid) == gid:
                 yield gid, g
 
     def claimed_sources(self):
-        """Return the set of (source_name, path) keys that are claimed."""
         return set(self._src_to_gid.keys())
 
-# ---------------------------------------------------------------------------
-# Matching phases
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Part 6 — Matching phases
+# ===========================================================================
 
 def _dedup_src(recs):
     seen, out = set(), []
@@ -455,16 +410,8 @@ def _dedup_src(recs):
 
 
 def match_nas_files(nas_records, by_hash, by_key, by_fuzzy, index):
-    """Phases 1-3: match each NAS file against source records.
-
-    Priority (first match wins):
-      1. Hash match or full key match → certain
-      2. Fuzzy key match (artist+title) → probable
-      3. No match → unknown
-    """
     for rec in nas_records:
         h_matches = by_hash.get(rec.get("hash"), [])
-
         key       = tuple(rec["key"]) if rec.get("key") else None
         k_matches = by_key.get(key, []) if key else []
 
@@ -483,10 +430,6 @@ def match_nas_files(nas_records, by_hash, by_key, by_fuzzy, index):
 
 
 def match_source_only(by_name, by_hash, by_key, by_fuzzy, index):
-    """Phase 4: cross-match source files not claimed by any NAS-anchored group.
-
-    Applies the same three tiers across source libraries.
-    """
     claimed = index.claimed_sources()
 
     for source_name, records in by_name.items():
@@ -495,7 +438,6 @@ def match_source_only(by_name, by_hash, by_key, by_fuzzy, index):
             if k in claimed:
                 continue
 
-            # Certain: hash or key match in a *different* source library
             h_others = [r for r in by_hash.get(rec.get("hash"), [])
                         if r["source"] != source_name]
             key      = tuple(rec["key"]) if rec.get("key") else None
@@ -508,7 +450,6 @@ def match_source_only(by_name, by_hash, by_key, by_fuzzy, index):
                 claimed.update((r["source"], r["path"]) for r in [rec] + certain_others)
                 continue
 
-            # Probable: fuzzy match in a different source library
             fkey         = tuple(rec["fuzzy_key"]) if rec.get("fuzzy_key") else None
             fuzzy_others = [r for r in by_fuzzy.get(fkey, [])
                             if r["source"] != source_name] if fkey else []
@@ -520,9 +461,9 @@ def match_source_only(by_name, by_hash, by_key, by_fuzzy, index):
             index.add_source_only(rec)
             claimed.add(k)
 
-# ---------------------------------------------------------------------------
-# Entry serialisation
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Part 7 — Index serialisation
+# ===========================================================================
 
 FIELDS_TO_COMPARE = [
     "artist", "title", "duration", "path",
@@ -531,11 +472,6 @@ FIELDS_TO_COMPARE = [
 
 
 def derive_entry_id(nas_recs, source_files_by_name):
-    """Stable string ID for a recording entry.
-
-    Prefers key from source records (typically more reliable tags), then NAS
-    key, then path-based fallbacks.
-    """
     for src_list in source_files_by_name.values():
         for r, _ in src_list:
             key = r.get("key")
@@ -571,11 +507,6 @@ def make_file_record(rec, identity_match):
 
 
 def build_fields(nas_recs, chosen_src_by_name, source_names):
-    """Build the fields comparison structure.
-
-    files.nas is always a list (or null), so fields[field]["nas"] is always a
-    list (or null) for consistency.  Source values are scalars or null.
-    """
     fields = {}
     for field in FIELDS_TO_COMPARE:
         values = {}
@@ -587,18 +518,12 @@ def build_fields(nas_recs, chosen_src_by_name, source_names):
     return fields
 
 
-def group_to_entry(gid, group, source_names, gid_to_entry_id):
-    """Convert a RecordingIndex group to a serialisable index entry.
-
-    'related' is stored as raw gids here and resolved to entry IDs in a second
-    pass after all groups have been assigned IDs.
-    """
+def group_to_index_entry(gid, group, source_names, gid_to_entry_id):
     nas_recs  = [r for r, _ in group["nas_files"]]
     nas_files = [make_file_record(r, m) for r, m in group["nas_files"]] or None
 
-    # For each source pick the best record (certain over probable)
-    src_files       = {}  # sn -> file_record (for entry)
-    chosen_src_recs = {}  # sn -> raw record  (for build_fields)
+    src_files       = {}
+    chosen_src_recs = {}
 
     for sn in source_names:
         candidates = group["source_files"].get(sn, [])
@@ -611,15 +536,14 @@ def group_to_entry(gid, group, source_names, gid_to_entry_id):
             src_files[sn]       = None
             chosen_src_recs[sn] = None
 
-    files    = {"nas": nas_files, **src_files}
     entry_id = derive_entry_id(nas_recs, group["source_files"])
     gid_to_entry_id[gid] = entry_id
 
     return {
         "id":                  entry_id,
         "identity_confidence": group["confidence"],
-        "files":               files,
-        "related":             list(group["related"]),   # gids — resolved below
+        "files":               {"nas": nas_files, **src_files},
+        "related":             list(group["related"]),   # raw gids; resolved below
         "fields":              build_fields(nas_recs, chosen_src_recs, source_names),
     }
 
@@ -633,16 +557,15 @@ def build_index(nas_records, source_names, by_name, by_hash, by_key, by_fuzzy):
     print("  Phase 4: cross-matching unclaimed source files...")
     match_source_only(by_name, by_hash, by_key, by_fuzzy, index)
 
-    print("  Serialising entries...")
+    print("  Serialising index entries...")
     gid_to_entry_id = {}
     raw_entries     = []
 
     for gid, group in index.all_groups():
-        entry = group_to_entry(gid, group, source_names, gid_to_entry_id)
+        entry = group_to_index_entry(gid, group, source_names, gid_to_entry_id)
         raw_entries.append((gid, entry))
 
-    # Resolve raw gids in 'related' to entry ID strings
-    for gid, entry in raw_entries:
+    for _, entry in raw_entries:
         entry["related"] = sorted({
             gid_to_entry_id[rg]
             for rg in entry["related"]
@@ -651,49 +574,277 @@ def build_index(nas_records, source_names, by_name, by_hash, by_key, by_fuzzy):
 
     return [e for _, e in raw_entries]
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Part 8 — Quality scoring & path utilities (for action generation)
+# ===========================================================================
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Scan NAS music library and build a recording index.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument("--root",      required=True,
-                        help="NAS music root directory")
-    parser.add_argument("--snapshots", nargs="+", required=True, metavar="SNAPSHOT",
-                        help="Source snapshot JSON files")
-    parser.add_argument("--output",    default="index.jsonl",
-                        help="Output JSONL file (default: index.jsonl)")
-    parser.add_argument("--cache",     default=DEFAULT_CACHE,
-                        help=f"Metadata cache file (default: {DEFAULT_CACHE})")
-    parser.add_argument("--ffprobe",   default="ffprobe",
-                        help="Path to ffprobe binary (default: ffprobe)")
-    args = parser.parse_args()
+CODEC_RANK = {"flac": 4, "alac": 4, "wav": 3, "aac": 2, "mp3": 1}
 
-    print("Scanning NAS...")
-    cache = load_cache(args.cache)
-    nas_records, cache = scan_nas(args.root, cache, args.ffprobe)
-    save_cache(cache, args.cache)
+def quality_score(rec):
+    """Comparable 4-tuple; higher is better.
 
-    print("Loading source snapshots...")
-    source_names, by_name, by_hash, by_key, by_fuzzy = load_source_snapshots(args.snapshots)
-    total_src = sum(len(v) for v in by_name.values())
-    print(f"  {total_src} source files across {len(source_names)} libraries: "
-          + ", ".join(f"{n} ({len(by_name[n])})" for n in source_names))
+    Lossless (rank 4) always beats lossy (rank ≤ 3).
+    Lossless tiebreak: bit depth then sample rate.
+    Lossy tiebreak: bitrate.  Never compare bitrate across codecs.
+    """
+    codec = (rec.get("codec") or "").lower()
+    rank  = CODEC_RANK.get(codec, 0)
+    if rank >= 4:
+        return (rank, rec.get("bits_per_sample") or 16, rec.get("sample_rate") or 44100, 0)
+    return (rank, 0, 0, rec.get("bitrate") or 0)
 
-    print("Building recording index...")
-    entries = build_index(nas_records, source_names, by_name, by_hash, by_key, by_fuzzy)
 
-    with open(args.output, "w", encoding="utf-8") as f:
-        for entry in entries:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+def strip_leading_sep(p):
+    return p.lstrip("/") if p else ""
 
-    # Summary
-    conf  = defaultdict(int)
-    multi = nas_only = src_only = 0
-    for e in entries:
+def nfc(p):
+    return unicodedata.normalize("NFC", p) if p else ""
+
+def path_notes(nas_path, src_path):
+    a = strip_leading_sep(nas_path or "")
+    b = strip_leading_sep(src_path  or "")
+    if a == b:       return []
+    if nfc(a) == nfc(b): return ["PATH_NFD"]
+    if a.lower() == b.lower(): return ["PATH_CASE"]
+    return ["PATH_MISMATCH"]
+
+# ===========================================================================
+# Part 9 — Action generation
+# ===========================================================================
+
+COMPARABLE_FIELDS = FIELDS_TO_COMPARE   # same list, aliased for clarity
+
+def compute_conflicts(entry, source_names):
+    fields    = entry.get("fields", {})
+    conflicts = []
+    for field in COMPARABLE_FIELDS:
+        fdata    = fields.get(field, {})
+        all_vals = []
+        nas_vals = fdata.get("nas")
+        if nas_vals is not None:
+            all_vals.extend(nas_vals)
+        for sn in source_names:
+            sv = fdata.get(sn)
+            if sv is not None:
+                all_vals.append(sv)
+        if len(set(str(v) for v in all_vals)) > 1:
+            conflicts.append(field)
+    return conflicts
+
+
+def find_case_collisions(entries):
+    by_lower = defaultdict(list)
+    for entry in entries:
+        for frec in (entry["files"].get("nas") or []):
+            p = strip_leading_sep(frec.get("path", ""))
+            by_lower[p.lower()].append(frec.get("path", ""))
+    colliding = set()
+    for group in by_lower.values():
+        if len(group) > 1:
+            colliding.update(group)
+    return colliding
+
+
+def select_canonical(src_file_recs, source_priority):
+    if not src_file_recs:
+        return None, False
+
+    def sort_key(r):
+        q   = quality_score(r)
+        pri = source_priority.index(r["source"]) \
+              if r["source"] in source_priority else 999
+        return (-q[0], -q[1], -q[2], -q[3], pri)
+
+    ranked = sorted(src_file_recs, key=sort_key)
+    best   = ranked[0]
+    if len(ranked) == 1:
+        return best, True
+    if sort_key(ranked[0]) == sort_key(ranked[1]):
+        return best, False
+    return best, True
+
+
+def nas_action_for(nas_frec, canonical_src, is_clear, confidence, collision_paths):
+    path  = nas_frec.get("path", "")
+    notes = []
+
+    if path in collision_paths:
+        notes.append("CASE_COLLISION")
+
+    if canonical_src is None:
+        return ("CASE_COLLISION" if "CASE_COLLISION" in notes else "UNKNOWN"), notes
+
+    if confidence == "probable":
+        notes.append("FUZZY_MATCH")
+        return "CNFLCT", notes
+
+    if not is_clear:
+        return "CNFLCT", notes
+
+    pnotes = path_notes(path, canonical_src.get("path", ""))
+    notes.extend(pnotes)
+
+    src_q = quality_score(canonical_src)
+    nas_q = quality_score(nas_frec)
+
+    if src_q >= nas_q:
+        if pnotes or nas_frec.get("hash") != canonical_src.get("hash"):
+            return "D_MV", notes
+        return "OK", notes
+    else:
+        return "KEEP", notes
+
+
+def source_actions_for(src_file_recs, canonical_src, is_clear, nas_action, nas_frec):
+    results = []
+    for sr in src_file_recs:
+        notes = []
+        if sr is canonical_src:
+            if nas_action in ("KEEP", "CNFLCT", "CASE_COLLISION"):
+                act = "SRC_AMB"
+            else:
+                act = "KEEP"
+                if nas_frec:
+                    notes.extend(path_notes(nas_frec.get("path", ""),
+                                            sr.get("path", "")))
+        else:
+            if not is_clear:
+                act = "SRC_AMB"
+            elif (canonical_src is not None
+                  and sr.get("hash") == canonical_src.get("hash")
+                  and strip_leading_sep(sr.get("path", "")) ==
+                      strip_leading_sep(canonical_src.get("path", ""))):
+                act = "KEEP"
+            else:
+                act = "SRC_D"
+        results.append((sr, act, notes))
+    return results
+
+
+def resolve_multi_nas(nas_frecs, canonical_src):
+    """Returns {path: is_preferred} for a list of NAS files."""
+    if not nas_frecs:
+        return {}
+    if canonical_src:
+        hash_match = [r for r in nas_frecs
+                      if r.get("hash") == canonical_src.get("hash")]
+        preferred  = hash_match[0] if hash_match else \
+                     max(nas_frecs, key=quality_score)
+    else:
+        preferred = max(nas_frecs, key=quality_score)
+    return {r.get("path"): (r is preferred) for r in nas_frecs}
+
+
+def process_entry(entry, source_names, source_priority, collision_paths):
+    nas_frecs  = entry["files"].get("nas") or []
+    confidence = entry["identity_confidence"]
+
+    src_file_recs = []
+    for sn in source_names:
+        frec = entry["files"].get(sn)
+        if frec is not None:
+            frec = dict(frec)
+            frec["source"] = sn
+            src_file_recs.append(frec)
+
+    canonical_src, is_clear = select_canonical(src_file_recs, source_priority)
+
+    # No NAS file — source-only entry
+    if not nas_frecs:
+        src_results = source_actions_for(src_file_recs, canonical_src, is_clear,
+                                         nas_action="UNKNOWN", nas_frec=None)
+        sources_out = [{**sr, "action": act, "notes": notes}
+                       for sr, act, notes in src_results]
+        return [{
+            "id":                  entry["id"],
+            "identity_confidence": confidence,
+            "nas":                 None,
+            "sources":             sources_out,
+            "conflicts":           compute_conflicts(entry, source_names),
+            "related":             entry.get("related", []),
+            "fields":              entry.get("fields", {}),
+        }]
+
+    preferred_map = resolve_multi_nas(nas_frecs, canonical_src)
+    decisions     = []
+
+    for nas_frec in nas_frecs:
+        is_preferred = preferred_map.get(nas_frec.get("path"), True)
+
+        if not is_preferred:
+            nas_action, nas_notes = "D_LQ", ["NAS_DUPLICATE"]
+        else:
+            nas_action, nas_notes = nas_action_for(
+                nas_frec, canonical_src, is_clear, confidence, collision_paths)
+
+        src_results = source_actions_for(src_file_recs, canonical_src, is_clear,
+                                         nas_action=nas_action, nas_frec=nas_frec)
+        sources_out = [{**sr, "action": act, "notes": notes}
+                       for sr, act, notes in src_results]
+
+        decisions.append({
+            "id":                  entry["id"],
+            "identity_confidence": confidence,
+            "nas":                 {**nas_frec, "action": nas_action, "notes": nas_notes},
+            "sources":             sources_out,
+            "conflicts":           compute_conflicts(entry, source_names),
+            "related":             entry.get("related", []),
+            "fields":              entry.get("fields", {}),
+        })
+
+    return decisions
+
+# ===========================================================================
+# Part 10 — Output writers
+# ===========================================================================
+
+def write_jsonl(records, path):
+    with open(path, "w", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+def write_nas_actions(decisions, path):
+    with open(path, "w", encoding="utf-8") as f:
+        for d in decisions:
+            nas = d.get("nas")
+            if nas is None:
+                continue
+            line = f"{nas.get('action', '?')}\t{nas.get('path', '')}"
+            notes = nas.get("notes", [])
+            if notes:
+                line += "\t" + " ".join(notes)
+            f.write(line + "\n")
+
+
+def write_source_actions(decisions, output_dir):
+    by_source = defaultdict(list)
+    for d in decisions:
+        for sr in d.get("sources", []):
+            sn    = sr.get("source", "unknown")
+            fpath = sr.get("path", "")
+            act   = sr.get("action", "?")
+            notes = sr.get("notes", [])
+            by_source[sn].append((fpath, act, notes))
+
+    for sn, rows in by_source.items():
+        safe = sn.replace("/", "_").replace(" ", "_")
+        out  = os.path.join(output_dir, f"{safe}_actions.txt")
+        with open(out, "w", encoding="utf-8") as f:
+            for fpath, act, notes in sorted(rows, key=lambda x: x[0]):
+                line = f"{act}\t{fpath}"
+                if notes:
+                    line += "\t" + " ".join(notes)
+                f.write(line + "\n")
+
+# ===========================================================================
+# Part 11 — Summary
+# ===========================================================================
+
+def print_summary(index_entries, decisions, source_names):
+    conf   = defaultdict(int)
+    multi  = nas_only = src_only = 0
+    for e in index_entries:
         conf[e["identity_confidence"]] += 1
         nas     = e["files"]["nas"]
         has_src = any(e["files"].get(sn) is not None for sn in source_names)
@@ -701,13 +852,140 @@ def main():
         if nas and not has_src:  nas_only += 1
         if not nas:              src_only += 1
 
-    print(f"\nRecording index: {len(entries)} entries → {args.output}")
+    nas_counts = defaultdict(int)
+    src_counts = defaultdict(int)
+    for d in decisions:
+        if d.get("nas"):
+            nas_counts[d["nas"].get("action", "?")] += 1
+        for sr in d.get("sources", []):
+            src_counts[sr.get("action", "?")] += 1
+
+    print(f"\n{'='*50}")
+    print("Recording index")
+    print(f"  Total entries:       {len(index_entries):>6}")
     print(f"  Certain confidence:  {conf['certain']:>6}")
     print(f"  Probable confidence: {conf['probable']:>6}")
     print(f"  No match:            {conf['none']:>6}")
     print(f"  Multi-NAS entries:   {multi:>6}")
     print(f"  NAS-only entries:    {nas_only:>6}")
     print(f"  Source-only entries: {src_only:>6}")
+
+    print("\nNAS actions")
+    for action in sorted(nas_counts):
+        print(f"  {action:<16} {nas_counts[action]:>6}")
+
+    print("\nSource actions")
+    for action in sorted(src_counts):
+        print(f"  {action:<16} {src_counts[action]:>6}")
+
+    needs_review = sum(nas_counts.get(a, 0) for a in ("CNFLCT", "CASE_COLLISION"))
+    to_move      = sum(nas_counts.get(a, 0) for a in ("D_MV", "D_LQ"))
+    print()
+    if needs_review:
+        print(f"  ⚠  {needs_review} NAS file(s) need manual review.")
+    print(f"  →  {to_move} NAS file(s) flagged for move to backup.")
+    print()
+
+# ===========================================================================
+# Part 12 — Main
+# ===========================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Scan NAS music library and produce cleanup action files.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--root", required=True,
+                        help="NAS music root directory")
+    parser.add_argument("--snapshots", nargs="+", required=True,
+                        metavar="SNAPSHOT",
+                        help="Source snapshot JSON files")
+    parser.add_argument("--source-priority", nargs="+", required=True,
+                        metavar="SOURCE",
+                        help="Source names in descending priority order; "
+                             "first is primary")
+    parser.add_argument("--output-dir", default="./results",
+                        help="Directory for all output files (default: ./results)")
+    parser.add_argument("--cache", default=DEFAULT_CACHE,
+                        help=f"Metadata cache file (default: {DEFAULT_CACHE})")
+    parser.add_argument("--ffprobe", default="ffprobe",
+                        help="Path to ffprobe binary (default: ffprobe)")
+    args = parser.parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # --- Scan NAS ---
+    print("Scanning NAS...")
+    cache = load_cache(args.cache)
+    nas_records, cache = scan_nas(args.root, cache, args.ffprobe)
+    save_cache(cache, args.cache)
+
+    # --- Load sources ---
+    print("Loading source snapshots...")
+    source_names, by_name, by_hash, by_key, by_fuzzy = \
+        load_source_snapshots(args.snapshots)
+    total_src = sum(len(v) for v in by_name.values())
+    print(f"  {total_src} source files across {len(source_names)} libraries: "
+          + ", ".join(f"{n} ({len(by_name[n])})" for n in source_names))
+
+    # Warn about any source names in priority list not found in snapshots
+    known = set(source_names)
+    for name in args.source_priority:
+        if name not in known:
+            print(f"  warning: --source-priority '{name}' not found in any snapshot")
+
+    # Extend source_names with any not mentioned in priority (lowest priority)
+    for name in source_names:
+        if name not in args.source_priority:
+            print(f"  warning: source '{name}' not in --source-priority; "
+                  f"appended with lowest priority")
+
+    # Build the ordered source list: priority order first, then any extras
+    ordered_sources = list(args.source_priority) + \
+                      [n for n in source_names if n not in args.source_priority]
+
+    # --- Build index ---
+    print("Building recording index...")
+    index_entries = build_index(nas_records, ordered_sources,
+                                by_name, by_hash, by_key, by_fuzzy)
+
+    index_path = os.path.join(args.output_dir, "index.jsonl")
+    write_jsonl(index_entries, index_path)
+    print(f"  Wrote {len(index_entries)} entries → {index_path}")
+
+    # --- Generate decisions & actions ---
+    print("Generating decisions and action files...")
+    collision_paths = find_case_collisions(index_entries)
+    if collision_paths:
+        print(f"  {len(collision_paths)} NAS path(s) involved in case collisions.")
+
+    all_decisions = []
+    for entry in index_entries:
+        all_decisions.extend(
+            process_entry(entry, ordered_sources, args.source_priority,
+                          collision_paths)
+        )
+
+    dec_path = os.path.join(args.output_dir, "decisions.jsonl")
+    nas_path = os.path.join(args.output_dir, "nas_actions.txt")
+
+    write_jsonl(all_decisions, dec_path)
+    write_nas_actions(all_decisions, nas_path)
+    write_source_actions(all_decisions, args.output_dir)
+
+    print(f"\nOutput written to {args.output_dir}/")
+    print(f"  index.jsonl         ({len(index_entries)} entries)")
+    print(f"  decisions.jsonl     ({len(all_decisions)} entries)")
+    nas_count = sum(1 for d in all_decisions if d.get("nas"))
+    print(f"  nas_actions.txt     ({nas_count} lines)")
+    for sn in ordered_sources:
+        safe = sn.replace("/", "_").replace(" ", "_")
+        n    = sum(sum(1 for sr in d.get("sources", []) if sr.get("source") == sn)
+                   for d in all_decisions)
+        print(f"  {safe}_actions.txt  ({n} lines)")
+
+    # --- Summary ---
+    print_summary(index_entries, all_decisions, ordered_sources)
 
 
 if __name__ == "__main__":
