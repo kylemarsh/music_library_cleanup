@@ -20,6 +20,7 @@ Actions that are no-ops (silently skipped):
   KEEP        File is the canonical version — keep in place
   UNKNOWN     No source match — leave alone
   SRC_ONLY    Source file not yet on NAS — will be rsynced later
+  SRC_AMB     Source file needs manual resolution (should be reviewed first)
 
 Actions that are skipped with a warning (unresolved):
   CNFLCT      Conflict requiring manual review
@@ -63,7 +64,7 @@ MOVE_ACTIONS = {"D_MV", "D_LQ", "SRC_D"}
 NOOP_ACTIONS = {"OK", "KEEP", "UNKNOWN", "SRC_ONLY"}
 
 # Actions that indicate unresolved human review items
-UNRESOLVED_ACTIONS = {"CNFLCT", "SRC_AMB", "CASE_COLLISION"}
+UNRESOLVED_ACTIONS = {"CNFLCT", "SRC_AMB", "CASE_COLLISION", "ORPHAN"}
 
 # ---------------------------------------------------------------------------
 # Parsing

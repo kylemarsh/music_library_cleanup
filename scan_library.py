@@ -13,8 +13,8 @@ Produces:
 Usage:
   python scan_library.py \\
     --root /volume1/Music \\
-    --snapshots src1_snapshot.json src2_snapshot.json \\
-    --source-priority source1 source2 \\
+    --snapshots liz_snapshot.json kyle_snapshot.json \\
+    --source-priority liz_laptop kyle_laptop \\
     [--output-dir ./results] \\
     [--cache music_audit_cache.json] \\
     [--ffprobe /usr/local/bin/ffprobe]
@@ -399,6 +399,16 @@ class RecordingIndex:
 # Part 6 — Matching phases
 # ===========================================================================
 
+FUZZY_DURATION_THRESHOLD = 10  # seconds; covers re-encode drift without bridging distinct recordings
+
+
+def _duration_secs(rec):
+    try:
+        return float(rec.get("duration") or 0)
+    except Exception:
+        return 0.0
+
+
 def _dedup_src(recs):
     seen, out = set(), []
     for r in recs:
@@ -420,8 +430,16 @@ def match_nas_files(nas_records, by_hash, by_key, by_fuzzy, index):
             index.add_certain(rec, certain)
             continue
 
-        fkey  = tuple(rec["fuzzy_key"]) if rec.get("fuzzy_key") else None
-        fuzzy = by_fuzzy.get(fkey, []) if fkey else []
+        fkey = tuple(rec["fuzzy_key"]) if rec.get("fuzzy_key") else None
+        if fkey:
+            nas_dur = _duration_secs(rec)
+            fuzzy   = _dedup_src([
+                r for r in by_fuzzy.get(fkey, [])
+                if abs(_duration_secs(r) - nas_dur) <= FUZZY_DURATION_THRESHOLD
+            ])
+        else:
+            fuzzy = []
+
         if fuzzy:
             index.add_probable(rec, fuzzy)
             continue
@@ -664,7 +682,8 @@ def select_canonical(src_file_recs, source_priority):
     return best, True
 
 
-def nas_action_for(nas_frec, canonical_src, is_clear, confidence, collision_paths):
+def nas_action_for(nas_frec, canonical_src, is_clear, confidence,
+                   collision_paths, matched_nas_by_fuzzy):
     path  = nas_frec.get("path", "")
     notes = []
 
@@ -672,7 +691,17 @@ def nas_action_for(nas_frec, canonical_src, is_clear, confidence, collision_path
         notes.append("CASE_COLLISION")
 
     if canonical_src is None:
-        return ("CASE_COLLISION" if "CASE_COLLISION" in notes else "UNKNOWN"), notes
+        if "CASE_COLLISION" in notes:
+            return "CASE_COLLISION", notes
+        # Check whether any other NAS file with a source match shares our
+        # fuzzy key — if so this is likely a stale duplicate (renamed/moved).
+        fkey = build_fuzzy_key(nas_frec)
+        if fkey and fkey in matched_nas_by_fuzzy:
+            dup_paths = [p for p in matched_nas_by_fuzzy[fkey] if p != path]
+            if dup_paths:
+                notes.append(f"LIKELY_DUP_OF:{dup_paths[0]}")
+                return "ORPHAN", notes
+        return "UNKNOWN", notes
 
     if confidence == "probable":
         notes.append("FUZZY_MATCH")
@@ -735,7 +764,8 @@ def resolve_multi_nas(nas_frecs, canonical_src):
     return {r.get("path"): (r is preferred) for r in nas_frecs}
 
 
-def process_entry(entry, source_names, source_priority, collision_paths):
+def process_entry(entry, source_names, source_priority, collision_paths,
+                  matched_nas_by_fuzzy):
     nas_frecs  = entry["files"].get("nas") or []
     confidence = entry["identity_confidence"]
 
@@ -775,7 +805,8 @@ def process_entry(entry, source_names, source_priority, collision_paths):
             nas_action, nas_notes = "D_LQ", ["NAS_DUPLICATE"]
         else:
             nas_action, nas_notes = nas_action_for(
-                nas_frec, canonical_src, is_clear, confidence, collision_paths)
+                nas_frec, canonical_src, is_clear, confidence,
+                collision_paths, matched_nas_by_fuzzy)
 
         src_results = source_actions_for(src_file_recs, canonical_src, is_clear,
                                          nas_action=nas_action, nas_frec=nas_frec)
@@ -878,11 +909,12 @@ def print_summary(index_entries, decisions, source_names):
     for action in sorted(src_counts):
         print(f"  {action:<16} {src_counts[action]:>6}")
 
-    needs_review = sum(nas_counts.get(a, 0) for a in ("CNFLCT", "CASE_COLLISION"))
+    needs_review = sum(nas_counts.get(a, 0) for a in ("CNFLCT", "CASE_COLLISION", "ORPHAN"))
     to_move      = sum(nas_counts.get(a, 0) for a in ("D_MV", "D_LQ"))
     print()
     if needs_review:
-        print(f"  ⚠  {needs_review} NAS file(s) need manual review.")
+        print(f"  ⚠  {needs_review} NAS file(s) need manual review "
+              f"(includes {nas_counts.get('ORPHAN', 0)} likely orphan(s)).")
     print(f"  →  {to_move} NAS file(s) flagged for move to backup.")
     print()
 
@@ -959,11 +991,23 @@ def main():
     if collision_paths:
         print(f"  {len(collision_paths)} NAS path(s) involved in case collisions.")
 
+    # Build fuzzy-key -> [nas_paths] map for NAS files that have source matches.
+    # Used to detect ORPHAN files: UNKNOWN NAS files whose fuzzy key appears
+    # here are likely stale duplicates of a matched file (e.g. after a rename).
+    matched_nas_by_fuzzy = defaultdict(list)
+    for entry in index_entries:
+        has_src = any(entry["files"].get(sn) is not None for sn in ordered_sources)
+        if has_src:
+            for frec in (entry["files"].get("nas") or []):
+                fkey = build_fuzzy_key(frec)
+                if fkey:
+                    matched_nas_by_fuzzy[fkey].append(frec["path"])
+
     all_decisions = []
     for entry in index_entries:
         all_decisions.extend(
             process_entry(entry, ordered_sources, args.source_priority,
-                          collision_paths)
+                          collision_paths, matched_nas_by_fuzzy)
         )
 
     dec_path = os.path.join(args.output_dir, "decisions.jsonl")
