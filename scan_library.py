@@ -849,14 +849,38 @@ def write_nas_actions(decisions, path):
 
 
 def write_source_actions(decisions, output_dir):
-    by_source = defaultdict(list)
+    # A source file can appear in multiple decision entries when a recording
+    # has more than one NAS file.  Deduplicate by (source, path), keeping the
+    # highest-priority action.
+    #
+    # Priority (highest first): KEEP > SRC_AMB > SRC_D > anything else.
+    # KEEP always wins — we never want a redundant decision entry to demote a
+    # file from KEEP to SRC_D.
+    ACTION_PRIORITY = {"KEEP": 0, "SRC_AMB": 1, "SRC_D": 2}
+
+    # best[(source_name, path)] = (action, notes)
+    best = {}
+
     for d in decisions:
         for sr in d.get("sources", []):
             sn    = sr.get("source", "unknown")
             fpath = sr.get("path", "")
             act   = sr.get("action", "?")
             notes = sr.get("notes", [])
-            by_source[sn].append((fpath, act, notes))
+            key   = (sn, fpath)
+
+            existing = best.get(key)
+            if existing is None:
+                best[key] = (act, notes)
+            else:
+                existing_act, existing_notes = existing
+                if ACTION_PRIORITY.get(act, 99) < ACTION_PRIORITY.get(existing_act, 99):
+                    best[key] = (act, notes)
+
+    # Group by source name for writing
+    by_source = defaultdict(list)
+    for (sn, fpath), (act, notes) in best.items():
+        by_source[sn].append((fpath, act, notes))
 
     for sn, rows in by_source.items():
         safe = sn.replace("/", "_").replace(" ", "_")
